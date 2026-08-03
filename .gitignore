@@ -3,6 +3,6 @@ __pycache__/
 *.pyc
 /scratch/
 /response.json
-backend/data_cache/images/
+data_cache/
+competitor_cache.json
 *.png
-
