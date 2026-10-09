@@ -13,8 +13,15 @@ MAX_POSTS    = 15
 
 
 def _extract_username(profile_url: str) -> str:
-    """Pull clean username out of any Instagram URL variant."""
-    return profile_url.strip().rstrip("/").split("/")[-1].split("?")[0].lower()
+    """Pull clean username out of any Instagram URL variant or raw handle."""
+    if not profile_url:
+        return ""
+    clean = profile_url.strip().lstrip("@")
+    clean = clean.split("?")[0].split("#")[0].rstrip("/")
+    parts = [p for p in clean.split("/") if p]
+    if not parts:
+        return ""
+    return parts[-1].lower()
 
 
 def _load_csv_for_profile(username: str) -> list | None:

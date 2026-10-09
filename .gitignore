@@ -6,3 +6,6 @@ __pycache__/
 data_cache/
 competitor_cache.json
 *.png
+cache_live_data.py
+test_gemini.py
+*.log

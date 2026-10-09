@@ -19,7 +19,7 @@ if not os.path.exists(HISTORY_DB_PATH):
         json.dump({}, f)
 
 import re
-from apify_service import scrape_latest_15_posts, get_real_follower_count, _generate_highly_authentic_posts, bulk_scrape_via_apify
+from apify_service import scrape_latest_15_posts, get_real_follower_count, _generate_highly_authentic_posts, bulk_scrape_via_apify, _extract_username
 from auditor import run_single_post_audit, run_hashtag_audit, run_batch_post_audits, generate_local_hashtag_audit_fallback
 
 # Load environment configuration
@@ -47,74 +47,108 @@ def health_check():
 
 from fastapi.responses import Response
 
+def _optimize_img_bytes(content: bytes, max_dim: int = 450, quality: int = 78) -> bytes:
+    try:
+        from PIL import Image
+        import io
+        im = Image.open(io.BytesIO(content))
+        im.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        im.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=True)
+        return buf.getvalue()
+    except Exception:
+        return content
+
 @app.get("/api/proxy-image")
 def proxy_image(url: str, post_url: str = None):
     import requests, re, os, hashlib
-    from fastapi.responses import RedirectResponse
     
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
     }
+    cors_hdrs = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "*",
+        "Access-Control-Allow-Headers": "*"
+    }
 
-    # 1. Check local cache first
-    try:
-        cache_dir = os.path.join(base_dir, "data_cache", "images")
-        os.makedirs(cache_dir, exist_ok=True)
-        
-        # Use shortcode from post_url if available, else hash the url
-        cache_key = None
-        if post_url:
-            m = re.search(r'/(?:p|reel|tv)/([^/?]+)', post_url)
+    cache_dir = os.path.join(base_dir, "data_cache", "images")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # 1. Extract shortcode
+    shortcode = None
+    for candidate in [post_url, url]:
+        if candidate:
+            m = re.search(r'/(?:p|reel|tv)/([^/?]+)', candidate)
             if m:
-                cache_key = m.group(1)
-        if not cache_key:
-            cache_key = hashlib.md5(url.split('?')[0].encode()).hexdigest()
-            
-        cache_path = os.path.join(cache_dir, f"{cache_key}.jpg")
-        
-        cors_hdrs = {"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "*", "Access-Control-Allow-Headers": "*"}
-        if os.path.exists(cache_path):
+                shortcode = m.group(1)
+                break
+
+    # 2. Check local disk cache
+    if shortcode:
+        cache_path = os.path.join(cache_dir, f"{shortcode}.jpg")
+        if os.path.exists(cache_path) and os.path.getsize(cache_path) > 1000:
             with open(cache_path, "rb") as f:
                 return Response(content=f.read(), media_type="image/jpeg", headers=cors_hdrs)
-    except Exception as e:
-        print(f"DEBUG: Cache read error: {e}")
-        cache_path = None
+    else:
+        # Fallback hash check
+        h_key = hashlib.md5(url.split('?')[0].encode()).hexdigest()
+        cache_path = os.path.join(cache_dir, f"{h_key}.jpg")
+        if os.path.exists(cache_path) and os.path.getsize(cache_path) > 1000:
+            with open(cache_path, "rb") as f:
+                return Response(content=f.read(), media_type="image/jpeg", headers=cors_hdrs)
 
-    try:
-        # 2. Try the provided CDN url directly
-        img_resp = requests.get(url, headers=headers, timeout=5)
-        if img_resp.status_code == 200:
-            if cache_path:
+    # 3. If not cached, fetch authentic Instagram image via /media/?size=l
+    if shortcode:
+        try:
+            ig_media_url = f"https://www.instagram.com/p/{shortcode}/media/?size=l"
+            ig_resp = requests.get(ig_media_url, headers=headers, allow_redirects=True, timeout=8)
+            if ig_resp.status_code == 200 and len(ig_resp.content) > 1000:
+                opt_content = _optimize_img_bytes(ig_resp.content)
                 try:
-                    with open(cache_path, "wb") as f:
-                        f.write(img_resp.content)
+                    with open(os.path.join(cache_dir, f"{shortcode}.jpg"), "wb") as f:
+                        f.write(opt_content)
                 except Exception:
                     pass
-            return Response(content=img_resp.content, media_type=img_resp.headers.get("Content-Type", "image/jpeg"), headers=cors_hdrs)
-        
-        # 3. If it failed (likely URL signature expired) and we have a post_url, fetch a fresh og:image
-        fallback_url = post_url or url
-        if "instagram.com/p/" in fallback_url or "instagram.com/reel/" in fallback_url or "instagram.com/tv/" in fallback_url:
-            r = requests.get(fallback_url, headers=headers, timeout=5)
-            m = re.search(r'<meta property="og:image"\s+content="([^"]+)"', r.text)
-            if m:
-                target_url = m.group(1).replace('&amp;', '&')
-                img_resp2 = requests.get(target_url, headers=headers, timeout=5)
-                if img_resp2.status_code == 200:
-                    if cache_path:
-                        try:
-                            with open(cache_path, "wb") as f:
-                                f.write(img_resp2.content)
-                        except Exception:
-                            pass
-                    return Response(content=img_resp2.content, media_type=img_resp2.headers.get("Content-Type", "image/jpeg"), headers=cors_hdrs)
-    except Exception:
-        pass
-    
-    # 4. Fallback to a placeholder instead of breaking the layout
-    seed = cache_key if 'cache_key' in locals() and cache_key else "fallback"
-    return RedirectResponse(url=f"https://picsum.photos/seed/{seed}/400/400")
+                return Response(content=opt_content, media_type="image/jpeg", headers=cors_hdrs)
+        except Exception as e:
+            print(f"[Proxy] ig media fetch error for {shortcode}: {e}")
+
+    # 4. Try provided direct CDN url
+    if url and url.startswith("http") and "picsum" not in url:
+        try:
+            cdn_resp = requests.get(url, headers=headers, timeout=6)
+            if cdn_resp.status_code == 200 and len(cdn_resp.content) > 1000:
+                opt_content = _optimize_img_bytes(cdn_resp.content)
+                if shortcode:
+                    try:
+                        with open(os.path.join(cache_dir, f"{shortcode}.jpg"), "wb") as f:
+                            f.write(opt_content)
+                    except Exception:
+                        pass
+                return Response(content=opt_content, media_type="image/jpeg", headers=cors_hdrs)
+        except Exception:
+            pass
+
+    # 5. Clean, professional SVG placeholder fallback (NEVER picsum.photos!)
+    label = f"Post: {shortcode}" if shortcode else "Instagram Media"
+    svg_fallback = f'''<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600" viewBox="0 0 600 600">
+      <defs>
+        <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stop-color="#f8fafc" />
+          <stop offset="100%" stop-color="#e2e8f0" />
+        </linearGradient>
+      </defs>
+      <rect width="600" height="600" fill="url(#bg)"/>
+      <rect x="220" y="210" width="160" height="160" rx="36" fill="none" stroke="#6366f1" stroke-width="10"/>
+      <circle cx="300" cy="290" r="44" fill="none" stroke="#6366f1" stroke-width="10"/>
+      <circle cx="348" cy="242" r="12" fill="#6366f1"/>
+      <text x="300" y="420" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" font-size="20" font-weight="600" fill="#475569">{label}</text>
+      <text x="300" y="450" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif" font-size="14" fill="#94a3b8">Authentic Instagram Creative</text>
+    </svg>'''
+    return Response(content=svg_fallback, media_type="image/svg+xml", headers=cors_hdrs)
 
 def get_real_follower_count(handle: str, fallback_calc: int) -> int:
     import requests, re, time
@@ -463,7 +497,7 @@ def get_dynamic_competitors(target_handle: str) -> list:
 def run_live_apify_competitor_audit(job_id: str, profile_url: str, date_from: str = None, date_to: str = None):
     try:
         # Extract clean handle
-        handle = profile_url.strip().rstrip("/").split("/")[-1].split("?")[0].lower()
+        handle = _extract_username(profile_url)
 
         # ── STEP 0: Determine competitor handles FIRST so we can bulk-fetch everything in ONE Apify call ──
         competitor_handles = get_dynamic_competitors(handle)
@@ -476,6 +510,10 @@ def run_live_apify_competitor_audit(job_id: str, profile_url: str, date_from: st
             # Guard against NoneType keys error if apify fails
             bulk_results = {}
         print(f"[Bulk Audit] Bulk fetch complete. Got data for: {list(bulk_results.keys())}")
+        try:
+            with open(os.path.join(base_dir, "data_cache", f"{handle}_raw_apify.json"), "w") as _f:
+                json.dump(bulk_results, _f, indent=2)
+        except: pass
 
         # ── STEP 2: Extract main profile posts from bulk results ──
         raw_posts = bulk_results.get(handle, [])
@@ -484,8 +522,15 @@ def run_live_apify_competitor_audit(job_id: str, profile_url: str, date_from: st
             raw_posts = scrape_latest_15_posts(profile_url, date_from, date_to)
         
         if not raw_posts:
-            print(f"[Bulk Audit] Scrape fallback returned no posts for @{handle}. Generating authentic fallback posts...")
-            raw_posts = _generate_highly_authentic_posts(profile_url)
+            error_msg = f"Live scraping unavailable for @{handle}. Please set a valid APIFY_API_TOKEN in the environment variables."
+            print(f"[Bulk Audit] Error: {error_msg}")
+            audit_jobs[job_id] = {"status": "error", "error": error_msg}
+            return
+            
+        try:
+            with open(os.path.join(base_dir, "data_cache", f"{handle}_final_apify.json"), "w") as _f:
+                json.dump(raw_posts, _f, indent=2)
+        except: pass
 
 
         parsed_posts = []
@@ -641,11 +686,12 @@ def run_live_apify_competitor_audit(job_id: str, profile_url: str, date_from: st
         average_likes = float(df["likes"].mean())
         average_comments = float(df["comments"].mean())
 
+        print("[Bulk Audit] Running batch post audits via AI...")
+        batch_briefs = run_batch_post_audits(parsed_posts, reels_median_likes, reels_median_comments, static_median_likes, static_median_comments)
         try:
-            batch_briefs = run_batch_post_audits(parsed_posts, reels_median_likes, reels_median_comments, static_median_likes, static_median_comments)
-        except Exception as batch_err:
-            print(f"DEBUG: Batch auditing failed: {batch_err}")
-            batch_briefs = {}
+            with open(os.path.join(base_dir, "data_cache", f"{handle}_openai_posts.json"), "w") as _f:
+                json.dump(batch_briefs, _f, indent=2)
+        except: pass
 
         audited_posts = []
         for post in parsed_posts:
@@ -714,11 +760,18 @@ def run_live_apify_competitor_audit(job_id: str, profile_url: str, date_from: st
 
         top_hashtags = sorted(hashtag_stats, key=lambda x: x["count"], reverse=True)[:10]
 
+        print("[Bulk Audit] Running hashtag strategy audit via AI...")
         try:
+            from auditor import run_hashtag_audit, run_overall_strategy_audit
             hashtag_brief = run_hashtag_audit(top_hashtags, median_likes)
         except Exception as e:
             print(f"DEBUG: Hashtag audit error: {e}. Cascading to local dynamic fallback.")
+            from auditor import generate_local_hashtag_audit_fallback
             hashtag_brief = generate_local_hashtag_audit_fallback(top_hashtags, median_likes)
+        try:
+            with open(os.path.join(base_dir, "data_cache", f"{handle}_openai_hashtags.json"), "w") as _f:
+                json.dump(hashtag_brief, _f, indent=2)
+        except: pass
 
         from auditor import calculate_metrics_package
         import concurrent.futures
@@ -742,6 +795,18 @@ def run_live_apify_competitor_audit(job_id: str, profile_url: str, date_from: st
 
         
         client_calc = calculate_metrics_package(parsed_posts, client_follower_count)
+
+        try:
+            overall_strategy = run_overall_strategy_audit(
+                reels_median_likes, 
+                static_median_likes, 
+                median_likes, 
+                client_calc.get("posting_frequency_weekly", 0)
+            )
+        except Exception as e:
+            print(f"DEBUG: Overall strategy audit error: {e}")
+            from auditor import generate_local_strategy_audit_fallback
+            overall_strategy = generate_local_strategy_audit_fallback()
 
         competitor_metrics_list = []
 
@@ -1031,35 +1096,31 @@ def run_live_apify_competitor_audit(job_id: str, profile_url: str, date_from: st
             })
 
         response_payload = {
+            "audited_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "follower_count": client_follower_count,
             "client_metrics": {
                 "profile_url": profile_url,
-            "reels_median_likes": reels_median_likes,
-            "reels_median_comments": reels_median_comments,
-            "static_median_likes": static_median_likes,
-            "static_median_comments": static_median_comments,
-            "median_likes": median_likes,
-            "median_comments": median_comments,
-            "average_likes": average_likes,
+                "reels_median_likes": reels_median_likes,
+                "reels_median_comments": reels_median_comments,
+                "static_median_likes": static_median_likes,
+                "static_median_comments": static_median_comments,
+                "median_likes": median_likes,
+                "median_comments": median_comments,
+                "average_likes": average_likes,
                 "average_comments": average_comments,
-                "posts": sorted_posts,
-                "hashtags_analysis": {
-                    "tags": top_hashtags,
-                    "ai_assessment": hashtag_brief
-                },
-                "follower_count": client_follower_count,
+                "posts": audited_posts,
+                "engagement_rate": client_calc.get("engagement_rate"),
                 "calculated_metrics": client_calc,
                 "performance_split": performance_split,
                 "niche_benchmark_data": niche_benchmark_data,
                 "reels_views_distribution": reels_views_distribution,
                 "reach_distribution_data": reach_distribution_data,
+                "overall_strategy": overall_strategy,
                 "leaderboard_data": leaderboard_data
             },
+            "hashtags_analysis": hashtag_brief,
             "competitor_metrics": competitor_metrics_list,
-            "reels_views_distribution": reels_views_distribution,
-            "reach_distribution_data": reach_distribution_data,
-            "cached": False,
-            "cache_age_days": 0,
-            "cache_age_hours": 0
+            "posts": audited_posts
         }
         
         # Save to history db
@@ -1184,7 +1245,15 @@ def get_history_snapshot(username: str):
         try:
             raw_posts = _generate_highly_authentic_posts(profile_url)
             posts_analyzed = run_batch_post_audits(raw_posts)
+            try:
+                with open(os.path.join(base_dir, "data_cache", f"{username_clean}_openai_posts.json"), "w") as _f:
+                    json.dump(posts_analyzed, _f, indent=2)
+            except: pass
             hashtags_analyzed = run_hashtag_audit(raw_posts)
+            try:
+                with open(os.path.join(base_dir, "data_cache", f"{username_clean}_openai_hashtags.json"), "w") as _f:
+                    json.dump(hashtags_analyzed, _f, indent=2)
+            except: pass
             follower_cnt = get_real_follower_count(username_clean, 50000)
             
             comp_handles = get_dynamic_competitors(username_clean)
@@ -1296,7 +1365,7 @@ def get_hashtag_intelligence(
     average engagements, and assigns system verdicts based on rule-based taxonomic logic.
     """
     # Parse handle
-    handle = profile_url.strip().rstrip("/").split("/")[-1].split("?")[0].lower()
+    handle = _extract_username(profile_url)
     
     # ── Check Supabase cache to bypass Apify live scraping ──
     raw_posts = None
@@ -1390,7 +1459,7 @@ async def get_dynamic_hashtag_analytics(
     engagement datasets and identifies reach-killing anchors for the dynamic dashboard.
     """
     # Parse handle
-    handle = profile_url.strip().rstrip("/").split("/")[-1].split("?")[0].lower()
+    handle = _extract_username(profile_url)
     
     # ── Check Supabase cache to bypass Apify live scraping ──
     raw_posts = None
@@ -1565,15 +1634,12 @@ async def get_dynamic_hashtag_analytics(
 
 # ── Serve static frontend files (HTML, CSS, JS) at the root level ──
 # Mounted at the very bottom of the file so explicit API routes defined above take precedence.
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+# from fastapi.staticfiles import StaticFiles
+# from fastapi.responses import FileResponse
 
-@app.get("/")
-def serve_frontend_index():
-    frontend_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "new-ui-ux-frontend")
-    return FileResponse(os.path.join(frontend_dir, "index.html"))
+# @app.get("/")
+# def serve_frontend_index():
+#     frontend_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "new-ui-ux-frontend")
+#     return FileResponse(os.path.join(frontend_dir, "index.html"))
 
-app.mount("/", StaticFiles(directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "new-ui-ux-frontend")), name="frontend")
-
-
-
+# app.mount("/", StaticFiles(directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "new-ui-ux-frontend")), name="frontend")

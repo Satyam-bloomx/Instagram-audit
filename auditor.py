@@ -190,7 +190,7 @@ def call_gemini_api(prompt, system_instruction=None, is_json=False):
     gemini_key = os.getenv("GEMINI_API_KEY")
     if not gemini_key:
         raise ValueError("Missing GEMINI_API_KEY")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key.strip()}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={gemini_key.strip()}"
     
     parts = []
     if system_instruction:
@@ -201,7 +201,7 @@ def call_gemini_api(prompt, system_instruction=None, is_json=False):
     if is_json:
         payload["generationConfig"] = {"responseMimeType": "application/json"}
         
-    resp = requests.post(url, json=payload, timeout=25)
+    resp = requests.post(url, json=payload, timeout=120)
     
     if not resp.ok:
         print(f"DEBUG: Gemini failed with {resp.status_code} in auditor. Falling back to OpenRouter...")
@@ -210,7 +210,7 @@ def call_gemini_api(prompt, system_instruction=None, is_json=False):
             or_url = "https://openrouter.ai/api/v1/chat/completions"
             or_sys = system_instruction or ""
             or_payload = {
-                "model": "google/gemini-2.5-flash",
+                "model": "google/gemini-3.1-flash-lite",
                 "messages": [
                     {"role": "system", "content": or_sys},
                     {"role": "user", "content": prompt}
@@ -221,13 +221,33 @@ def call_gemini_api(prompt, system_instruction=None, is_json=False):
                 or_payload["response_format"] = {"type": "json_object"}
                 
             or_headers = {"Authorization": f"Bearer {openrouter_key.strip()}"}
-            or_resp = requests.post(or_url, json=or_payload, headers=or_headers, timeout=25)
+            or_resp = requests.post(or_url, json=or_payload, headers=or_headers, timeout=120)
             or_resp.raise_for_status()
-            return or_resp.json()["choices"][0]["message"]["content"]
+            or_text = or_resp.json()["choices"][0]["message"]["content"]
+            if is_json:
+                or_text = or_text.strip()
+                if or_text.startswith("```json"):
+                    or_text = or_text[7:]
+                elif or_text.startswith("```"):
+                    or_text = or_text[3:]
+                if or_text.endswith("```"):
+                    or_text = or_text[:-3]
+                or_text = or_text.strip()
+            return or_text
         else:
             resp.raise_for_status()
             
-    return resp.json().get("candidates", [])[0].get("content", {}).get("parts", [])[0].get("text", "")
+    text = resp.json().get("candidates", [])[0].get("content", {}).get("parts", [])[0].get("text", "")
+    if is_json:
+        text = text.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        elif text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+    return text
 
 
 def generate_local_fallback_brief(post, is_above, median_likes, median_comments):
@@ -395,24 +415,18 @@ We performed a deep-dive diagnostic check on the underperforming assets that dro
 
 def generate_local_hashtag_audit_fallback(hashtag_data, overall_median_likes):
     if not hashtag_data:
-        return f"""### AI HASHTAG STRATEGY ASSESSMENT
-* **No Telemetry:** Add hashtags to captions.
-
-### GROWTH RECOMMENDATIONS
-* **Volume:** Keep tags under 5.
-* **Niche:** Use tags matching theme."""
+        return {
+            "popularity_report": "### 🟢 POPULARITY REPORT\n* **No Telemetry:** Add hashtags to captions.",
+            "checklist_new_ideas": "### 📋 CHECKLIST\n* **Volume:** Keep tags under 5.\n* **Niche:** Use tags matching theme."
+        }
         
     top_tag = hashtag_data[0]["tag"]
     top_engagement = hashtag_data[0]["avg_likes"]
     
-    return f"""### AI HASHTAG STRATEGY ASSESSMENT
-* **Top Tag:** {top_tag} ({top_engagement:,} likes).
-* **Friction:** Broad hashtags drag reach. Use niche tags.
-
-### GROWTH RECOMMENDATIONS
-* **Double Down:** {top_tag}.
-* **Volume:** Keep under 5 tags.
-* **Niche:** Use focused variations."""
+    return {
+        "popularity_report": f"### 🟢 POPULARITY REPORT\n* **Top Tag:** {top_tag} ({top_engagement:,} likes).\n* **Friction:** Broad hashtags drag reach. Use niche tags.",
+        "checklist_new_ideas": f"### 📋 CHECKLIST\n* **Double Down:** {top_tag}.\n* **Volume:** Keep under 5 tags.\n* **Niche:** Use focused variations."
+    }
 
 
 def run_batch_post_audits(posts, reels_median_likes, reels_median_comments, static_median_likes, static_median_comments):
@@ -670,8 +684,6 @@ def run_hashtag_audit(hashtag_data, overall_median_likes):
     if not gemini_key:
         return generate_local_hashtag_audit_fallback(hashtag_data, overall_median_likes)
         
-    # genai.configure(api_key=gemini_key)
-    
     prompt = f"""
     You are an elite Senior Social Media Strategist. Audit the following hashtag performance metrics for an Instagram profile.
     
@@ -680,28 +692,80 @@ def run_hashtag_audit(hashtag_data, overall_median_likes):
     
     Overall Account Median Likes baseline is: {overall_median_likes}
 
-    Generate an audit card containing these exact two sections. Keep it highly action-oriented and brief:
-    
-    ### AI HASHTAG STRATEGY ASSESSMENT
+    Return a strictly formatted JSON object with TWO keys: "popularity_report" and "checklist_new_ideas".
+    Each key must contain a Markdown formatted string answering the following:
+
+    For "popularity_report":
+    ### 🟢 HASHTAG POPULARITY REPORT
     * **Top Performer:** [Hashtag name] is the primary driver (averaging [number] likes).
-    * **Key Issue:** [1 extremely short bullet point identifying the single core issue, e.g. generic tags cluttering categorization or niche tags underutilized. Maximum 15 words.]
+    * **Key Issue:** [1 short bullet identifying the single core issue. Max 15 words.]
     
-    ### GROWTH RECOMMENDATIONS
-    * **Double Down:** [Hashtag name] (exceeds your {overall_median_likes} median baseline).
-    * **Optimal Volume:** Keep total hashtags below [5-8] per post to prevent classification bloat.
-    * **Niche Targets:** Use highly focused niche tags (e.g. #galaxy, #astrophotography) rather than generic anchors.
+    For "checklist_new_ideas":
+    ### 📋 HASHTAG CHECKLIST & NEW IDEAS
+    * **Double Down:** [Hashtag name] (exceeds your median baseline).
+    * **Optimal Volume:** Keep total hashtags below [5-8] per post.
+    * **New Idea 1:** [Provide a highly focused niche tag related to the theme]
+    * **New Idea 2:** [Provide another focused niche tag]
     
-    CRITICAL CONSTRAINT: You must keep both sections extremely brief, key points only, and very short. Do not write a long narrative or descriptive paragraph. Keep each bullet point under 15 words.
+    CRITICAL CONSTRAINT: Keep bullet points extremely brief, under 15 words.
+    Return ONLY raw JSON, no markdown code block wrapping.
     """
     
     try:
-        return call_gemini_api(prompt)
+        response_text = call_gemini_api(prompt, is_json=True)
+        return json.loads(response_text)
     except Exception as e:
-        try:
-            return call_gemini_api(prompt)
-        except Exception as fallback_error:
-            print(f"DEBUG: Hashtag audit API failed. Cascading to local premium growth card.")
-            return generate_local_hashtag_audit_fallback(hashtag_data, overall_median_likes)
+        print(f"DEBUG: Hashtag audit API failed. Cascading to local premium growth card.")
+        return generate_local_hashtag_audit_fallback(hashtag_data, overall_median_likes)
+
+def generate_local_strategy_audit_fallback():
+    return {
+        "reels_vs_static": "### 🎬 REELS VS STATIC\n* **Reels:** Driving primary reach.\n* **Static:** Good for community building.",
+        "performance_snapshot": "### 📈 SNAPSHOT\n* **Status:** Stable growth pattern.\n* **Key Driver:** Consistent posting.",
+        "step_by_step_plan": "### 🚀 30-DAY GROWTH PLAN\n* **Week 1-2:** Focus on strong 3-second hooks.\n* **Week 3-4:** Experiment with carousel depth."
+    }
+
+def run_overall_strategy_audit(reels_median, static_median, overall_median, posting_freq):
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_key:
+        return generate_local_strategy_audit_fallback()
+        
+    prompt = f"""
+    You are an elite Senior Social Media Strategist. Generate a macro-level strategy assessment for an Instagram profile.
+    
+    Data:
+    - Reels Median Likes: {reels_median}
+    - Static Post Median Likes: {static_median}
+    - Overall Median Likes: {overall_median}
+    - Posting Frequency: {posting_freq} posts/week
+    
+    Return a strictly formatted JSON object with THREE keys: "reels_vs_static", "performance_snapshot", and "step_by_step_plan".
+    
+    For "reels_vs_static":
+    ### 🎬 REELS VS STATIC
+    * **The Winner:** [Declare which format is performing better and why. Max 15 words.]
+    * **The Gap:** [Mention the difference in median likes. Max 15 words.]
+    
+    For "performance_snapshot":
+    ### 📈 PERFORMANCE SNAPSHOT
+    * **Health Check:** [Assess overall posting frequency and median likes. Max 15 words.]
+    * **Primary Bottleneck:** [Identify potential issue based on frequency or performance. Max 15 words.]
+    
+    For "step_by_step_plan":
+    ### 🚀 30-DAY GROWTH PLAN
+    * **Phase 1 (Fix Hooks):** [1 action item for first 3 seconds. Max 10 words.]
+    * **Phase 2 (Content Mix):** [1 action item for reels/static ratio. Max 10 words.]
+    * **Phase 3 (Community):** [1 action item for comments/engagement. Max 10 words.]
+    
+    Return ONLY raw JSON, no markdown code block wrapping.
+    """
+    
+    try:
+        response_text = call_gemini_api(prompt, is_json=True)
+        return json.loads(response_text)
+    except Exception as e:
+        print(f"DEBUG: Strategy audit API failed. Cascading to local fallback.")
+        return generate_local_strategy_audit_fallback()
 
 
 def calculate_metrics_package(posts: list, follower_count: int) -> dict:
